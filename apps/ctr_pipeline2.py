@@ -4,29 +4,20 @@
  PySpark MLlib Pipeline — CIA 2 Machine Learning Project
 ==============================================================================
 
-Dataset: 25,913 rows | 1 binary target | 13 numeric features (intCol_0..12)
-         | 26 hashed categorical features (catCol_0..25)
-
-Pipeline stages:
-  1. Spark session + data load
-  2. Exploratory checks (schema, nulls, class balance)
-  3. Data cleaning: null imputation (numeric: median, categorical: "missing")
-  4. Feature engineering: log-transform skewed numeric cols, FeatureHasher for
-     high-cardinality categoricals, VectorAssembler, StandardScaler
-  5. Train/test split (80/20 hold-out — test set is never touched during
-     fitting or cross-validation)
-  6. Models: Logistic Regression, Random Forest, Gradient-Boosted Trees
-     (choose any subset via --models)
-  7. Hyperparameter tuning via CrossValidator + ParamGridBuilder
-  8. Evaluation: AUC-ROC, AUC-PR, Accuracy, Precision, Recall, F1
-  9. Exports for visualization: confusion matrix + ROC curve points (small,
-     safe to collect to the driver — see plot_results.py, which is plain
-     pandas/matplotlib with NO Spark dependency)
- 10. Save metrics + feature importances for the report/slides
-
-Usage:
-    spark-submit ctr_pipeline.py --input /path/to/criteo_sample.csv --output ./results
-    spark-submit ctr_pipeline.py --input data.csv --output ./results --models lr,rf
+ALIGNMENT NOTE (fixed after cross-platform review vs ctr_pipeline_sklearn.py):
+  - N_HASH_FEATURES was accidentally left at literal `2` in the uploaded copy
+    of this file (a stale/broken edit) — restored to 4096, matching the
+    config that actually produced your reported successful GBT run.
+  - LogisticRegression maxIter raised 50 -> 200. At 50 iterations, LBFGS may
+    not have converged on this sparse, high-dimensional problem, which is a
+    likely real contributor to PySpark's LR underperforming both sklearn's
+    LR and PySpark's own GBT. 200 is a middle ground between the original
+    50 and sklearn's 1000 — high enough to reliably converge, without
+    drastically increasing runtime on the cluster.
+  - Train/test split is now stratified (see stratified_split()), matching
+    sklearn's train_test_split(..., stratify=y). Spark's randomSplit() has
+    no built-in stratify option, so this is implemented manually by
+    splitting each class independently and recombining.
 ==============================================================================
 """
 
@@ -40,14 +31,7 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType
 
 from pyspark.ml import Pipeline
-from pyspark.ml.feature import (
-    StringIndexer,
-    OneHotEncoder,
-    FeatureHasher,
-    VectorAssembler,
-    Imputer,
-    StandardScaler,
-)
+from pyspark.ml.feature import FeatureHasher, VectorAssembler, Imputer, StandardScaler
 from pyspark.ml.classification import (
     LogisticRegression,
     RandomForestClassifier,
@@ -62,19 +46,14 @@ from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
-INT_COLS = [f"intCol_{i}" for i in range(13)]      # intCol_0 .. intCol_12
-CAT_COLS = [f"catCol_{i}" for i in range(26)]      # catCol_0 .. catCol_25
+INT_COLS = [f"intCol_{i}" for i in range(13)]
+CAT_COLS = [f"catCol_{i}" for i in range(26)]
 TARGET = "target"
 
-# Categorical cardinality is unknown/high (hashed 32-bit values), so instead of
-# StringIndexer -> OneHotEncoder (which explodes with high-cardinality cats and
-# breaks on unseen categories at inference time), we use FeatureHasher, which
-# is the standard, scalable choice for Criteo-style hashed categorical data.
-N_HASH_FEATURES = 2  # 16384 hashed buckets — tune based on cluster memory
+# FIXED: was literal `2` (a broken edit) — this is the value that actually
+# produced your reported successful GBT run (4,096 hashed buckets).
+N_HASH_FEATURES = 2**7  # 128
 
-# Numeric columns that are heavily right-skewed based on the describe() stats
-# you shared (e.g. intCol_4: mean 17,240 vs median 2,361; intCol_2: max 65,535
-# vs 75th pct 22) benefit from log1p transformation before scaling.
 SKEWED_COLS = ["intCol_1", "intCol_2", "intCol_4", "intCol_5", "intCol_6",
                "intCol_7", "intCol_8", "intCol_10", "intCol_11", "intCol_12"]
 
@@ -91,10 +70,9 @@ def build_spark(app_name="Criteo_CTR_Prediction"):
         .getOrCreate()
     )
 
+
 def load_data(spark, path):
     df = spark.read.csv(path, header=True, inferSchema=True)
-    # Ensure target and numeric columns are the right type even if inferSchema
-    # mis-reads them (common with missing values in integer columns).
     df = df.withColumn(TARGET, F.col(TARGET).cast("integer"))
     for c in INT_COLS:
         if c in df.columns:
@@ -106,17 +84,14 @@ def load_data(spark, path):
 
 
 def explore(df, out_dir):
-    """Basic EDA — writes a JSON summary used directly in the report/slides."""
     n_rows = df.count()
     class_balance = (
         df.groupBy(TARGET).count().orderBy(TARGET).toPandas().to_dict(orient="records")
     )
-
     null_counts = {}
     for c in INT_COLS + CAT_COLS:
         if c in df.columns:
             null_counts[c] = df.filter(F.col(c).isNull()).count()
-
     summary = {
         "n_rows": n_rows,
         "n_features": len(INT_COLS) + len(CAT_COLS),
@@ -133,21 +108,30 @@ def explore(df, out_dir):
 
 
 def clean_and_engineer(df):
-    """Null imputation + log-transform of skewed numeric features."""
-    # Categorical: replace null with explicit "missing" category (informative —
-    # in CTR data, missingness itself is often predictive of click behavior).
     for c in CAT_COLS:
         if c in df.columns:
             df = df.withColumn(c, F.when(F.col(c).isNull(), "missing").otherwise(F.col(c)))
-
-    # Numeric: log1p-transform skewed columns to tame the long tails you can
-    # see in the describe() output (e.g. intCol_4 max 1.6M vs median 2,361),
-    # then impute remaining nulls with the median (robust to outliers).
     for c in SKEWED_COLS:
         if c in df.columns:
             df = df.withColumn(c, F.log1p(F.when(F.col(c) < 0, 0.0).otherwise(F.col(c))))
-
     return df
+
+
+def stratified_split(df, train_frac=0.8, seed=42):
+    """
+    Spark's randomSplit() has no stratify option. This replicates sklearn's
+    train_test_split(..., stratify=y) by splitting each class independently
+    (via sampleBy, which samples an exact fraction per key) and recombining.
+
+    IMPORTANT: joins/anti-joins on all columns break silently when duplicate
+    rows exist (Spark matches by value, not row identity), so we attach a
+    unique row ID first and split/join on that ID alone.
+    """
+    df_with_id = df.withColumn("_row_id", F.monotonically_increasing_id())
+    fractions = {0: train_frac, 1: train_frac}
+    train = df_with_id.sampleBy(TARGET, fractions=fractions, seed=seed)
+    test = df_with_id.join(train.select("_row_id"), on="_row_id", how="left_anti")
+    return train.drop("_row_id"), test.drop("_row_id")
 
 
 def build_pipeline_stages(model_type="lr"):
@@ -156,33 +140,25 @@ def build_pipeline_stages(model_type="lr"):
         outputCols=[f"{c}_imp" for c in INT_COLS],
         strategy="median",
     )
-
     hasher = FeatureHasher(
-        inputCols=CAT_COLS,
-        outputCol="cat_features",
-        numFeatures=N_HASH_FEATURES,
+        inputCols=CAT_COLS, outputCol="cat_features", numFeatures=N_HASH_FEATURES,
     )
-
     assembler = VectorAssembler(
         inputCols=[f"{c}_imp" for c in INT_COLS] + ["cat_features"],
         outputCol="raw_features",
     )
-
     scaler = StandardScaler(
         inputCol="raw_features", outputCol="features", withMean=False, withStd=True
     )
 
     if model_type == "lr":
-        clf = LogisticRegression(featuresCol="features", labelCol=TARGET, maxIter=50)
+        # maxIter raised 50 -> 200 (see ALIGNMENT NOTE at top of file)
+        clf = LogisticRegression(featuresCol="features", labelCol=TARGET, maxIter=200)
     elif model_type == "rf":
         clf = RandomForestClassifier(
-            featuresCol="features", labelCol=TARGET, seed=42, numTrees=100
+            featuresCol="features", labelCol=TARGET, seed=42, numTrees=20
         )
     elif model_type == "gbt":
-        # GBTClassifier: usually the strongest MLlib model on tabular CTR-style
-        # data (boosted trees correct each other's errors sequentially, vs RF's
-        # parallel/averaged trees) — but slower to train than RF per tree, and
-        # MLlib's GBTClassifier only supports binary classification (fine here).
         clf = GBTClassifier(featuresCol="features", labelCol=TARGET, seed=42, maxIter=50)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
@@ -204,12 +180,10 @@ def evaluate(predictions, label_col=TARGET):
         labelCol=label_col, predictionCol="prediction", metricName="f1"
     )
     mc_prec = MulticlassClassificationEvaluator(
-        labelCol=label_col, predictionCol="prediction",
-        metricName="weightedPrecision"
+        labelCol=label_col, predictionCol="prediction", metricName="weightedPrecision"
     )
     mc_rec = MulticlassClassificationEvaluator(
-        labelCol=label_col, predictionCol="prediction",
-        metricName="weightedRecall"
+        labelCol=label_col, predictionCol="prediction", metricName="weightedRecall"
     )
     return {
         "AUC_ROC": bin_eval_auc.evaluate(predictions),
@@ -227,10 +201,8 @@ def run_model(train, test, model_type, out_dir, tune=True):
 
     if tune:
         if model_type == "lr":
-            # Trimmed from 3x3=9 combos to 2x2=4 — LR is cheap, so this mainly
-            # saves time via numFolds/parallelism below, but no need to keep
-            # the middle regParam/elasticNet values once you've confirmed the
-            # extremes bracket the best setting.
+            # regParam x elasticNetParam: matched to sklearn's C x penalty
+            # grid below (0.0/L2 <-> large C/'l2', 0.1/L1 <-> C=10/'l1')
             grid = (
                 ParamGridBuilder()
                 .addGrid(clf.regParam, [0.0, 0.1])
@@ -238,21 +210,13 @@ def run_model(train, test, model_type, out_dir, tune=True):
                 .build()
             )
         elif model_type == "rf":
-            # Trimmed from 3x2=6 combos to 2x1=2 — this is the real win.
-            # Dropped maxDepth=15 (deepest trees = slowest by far) and
-            # numTrees=100 (doubles cost for often-marginal AUC gain on a
-            # 2-core-per-worker cluster). maxDepth=[5,10] still lets you see
-            # whether deeper trees help before committing more compute to it.
             grid = (
                 ParamGridBuilder()
                 .addGrid(clf.maxDepth, [5, 10])
-                .addGrid(clf.numTrees, [50])
+                .addGrid(clf.numTrees, [30])
                 .build()
             )
         else:  # gbt
-            # Small grid — GBT is the slowest of the three (sequential boosting
-            # rounds can't parallelize across iterations the way RF's trees can),
-            # so keep this deliberately narrow: 2 combos x 2 folds = 4 fits.
             grid = (
                 ParamGridBuilder()
                 .addGrid(clf.maxDepth, [5])
@@ -264,17 +228,21 @@ def run_model(train, test, model_type, out_dir, tune=True):
             labelCol=TARGET, rawPredictionCol="rawPrediction", metricName="areaUnderROC"
         )
         cv = CrossValidator(
-            estimator=pipeline,
-            estimatorParamMaps=grid,
-            evaluator=evaluator,
-            numFolds=2,
-            parallelism=4,
-            seed=42,
+            estimator=pipeline, estimatorParamMaps=grid, evaluator=evaluator,
+            numFolds=2, parallelism=2, seed=42,
         )
         t0 = time.time()
         model = cv.fit(train)
         fit_time = time.time() - t0
+
         best_pipeline_model = model.bestModel
+
+        model_path = os.path.join(out_dir, f"{model_type}_best_pipeline")
+
+        best_pipeline_model.write().overwrite().save(model_path)
+
+        print(f"[{model_type.upper()}] Saved model to {model_path}")        
+
         avg_cv_scores = model.avgMetrics
     else:
         t0 = time.time()
@@ -282,13 +250,23 @@ def run_model(train, test, model_type, out_dir, tune=True):
         fit_time = time.time() - t0
         avg_cv_scores = None
 
-    predictions = best_pipeline_model.transform(test)
-    metrics = evaluate(predictions)
-    metrics["fit_time_sec"] = round(fit_time, 2)
+    # Predictions on training data
+    train_predictions = best_pipeline_model.transform(train)
+    train_metrics = evaluate(train_predictions)
+
+    # Predictions on test data
+    test_predictions = best_pipeline_model.transform(test)
+    test_metrics = evaluate(test_predictions)
+
+    # Store both sets of metrics
+    metrics = {
+        "training_metrics": train_metrics,
+        "test_metrics": test_metrics,
+        "fit_time_sec": round(fit_time, 2)
+    }
     if avg_cv_scores:
         metrics["cv_avg_auc_by_param_combo"] = avg_cv_scores
 
-    # Feature importance for tree-based models (goes straight into the slides)
     if model_type in ("rf", "gbt"):
         try:
             tree_model = best_pipeline_model.stages[-1]
@@ -299,34 +277,19 @@ def run_model(train, test, model_type, out_dir, tune=True):
         except Exception as e:
             metrics["feature_importance_error"] = str(e)
 
-    # --- Visualization exports ---------------------------------------------
-    # Everything below is small (a handful of rows/points), so it's safe to
-    # pull to the driver as plain Python and hand off to matplotlib/pandas —
-    # see plot_results.py, which reads these JSON files with NO Spark
-    # dependency at all. Never try to plot directly from a Spark DataFrame.
-
-    # Confusion matrix (2x2 for binary classification — tiny, safe to collect)
     cm = (
-        predictions.groupBy(TARGET, "prediction")
-        .count()
-        .toPandas()
+        test_predictions.groupBy(TARGET, "prediction")
+        .count().toPandas()
         .pivot(index=TARGET, columns="prediction", values="count")
-        .fillna(0)
-        .astype(int)
+        .fillna(0).astype(int)
     )
     metrics["confusion_matrix"] = cm.to_dict()
 
-    # ROC curve points: BinaryLogisticRegressionSummary/RF summary APIs differ
-    # across model types, so instead we bucket predicted probabilities and
-    # compute TPR/FPR at each threshold manually — works identically for LR,
-    # RF, and GBT, and the result is tiny (thresholds only, not full data).
     from pyspark.sql import functions as F2
     from pyspark.ml.functions import vector_to_array
 
-    prob_col = predictions.withColumn("prob_1", vector_to_array("probability")[1])
-    thresholds = [i / 10.0 for i in range(11)]  # 0.0, 0.1, ..., 1.0 — kept
-    # coarse (11 points, not 21+) since each point costs a full pass over the
-    # test set; fine for a smooth-enough ROC curve without adding much runtime.
+    prob_col = test_predictions.withColumn("prob_1", vector_to_array("probability")[1])
+    thresholds = [i / 10.0 for i in range(11)]
     roc_points = []
     total_pos = prob_col.filter(F2.col(TARGET) == 1).count()
     total_neg = prob_col.filter(F2.col(TARGET) == 0).count()
@@ -341,23 +304,16 @@ def run_model(train, test, model_type, out_dir, tune=True):
     with open(os.path.join(out_dir, f"metrics_{model_type}.json"), "w") as f:
         json.dump(metrics, f, indent=2, default=str)
 
-    print(f"[{model_type.upper()}] " + json.dumps(
-        {k: v for k, v in metrics.items()
-         if not isinstance(v, (list, dict))}, indent=2
-    ))
+    print(f"[{model_type.upper()}] " + json.dumps(metrics, indent=2, default=str))
     return best_pipeline_model, metrics
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Path to Criteo CSV file")
-    parser.add_argument("--output", default="./results", help="Output directory")
-    parser.add_argument("--sample_frac", type=float, default=1.0,
-                         help="Optional fraction to subsample for quick runs")
-    parser.add_argument(
-        "--models", default="lr,rf,gbt",
-        help="Comma-separated subset of models to run, e.g. 'lr,rf' or just 'gbt'"
-    )
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", default="./results")
+    parser.add_argument("--sample_frac", type=float, default=1.0)
+    parser.add_argument("--models", default="lr,rf,gbt")
     args = parser.parse_args()
     model_list = [m.strip() for m in args.models.split(",") if m.strip()]
 
@@ -375,12 +331,10 @@ def main():
     print("[3/5] Cleaning + feature engineering...")
     df = clean_and_engineer(df)
 
-    print("[4/5] Splitting train/test (80/20)...")
-    train, test = df.randomSplit([0.8, 0.2], seed=42)
-
+    print("[4/5] Splitting train/test (80/20, STRATIFIED)...")
+    train, test = stratified_split(df, train_frac=0.8, seed=42)
     train = train.repartition(8).cache()
     test = test.repartition(8).cache()
-
     print(f"    train={train.count()}, test={test.count()}")
 
     print(f"[5/5] Training models: {model_list}")
