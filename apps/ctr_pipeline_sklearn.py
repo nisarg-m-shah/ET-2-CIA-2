@@ -74,7 +74,7 @@ CAT_COLS = [f"catCol_{i}" for i in range(26)]
 TARGET = "target"
 SKEWED_COLS = ["intCol_1", "intCol_2", "intCol_4", "intCol_5", "intCol_6",
                "intCol_7", "intCol_8", "intCol_10", "intCol_11", "intCol_12"]
-N_HASH_FEATURES = 2 ** 12  # 4096 — matches PySpark's fixed value
+N_HASH_FEATURES = 2 ** 7  # 4096 — matches PySpark's fixed value
 
 
 def load_and_clean(path):
