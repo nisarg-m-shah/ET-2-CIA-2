@@ -72,14 +72,37 @@ from scipy.sparse import hstack, csr_matrix
 INT_COLS = [f"intCol_{i}" for i in range(13)]
 CAT_COLS = [f"catCol_{i}" for i in range(26)]
 TARGET = "target"
-SKEWED_COLS = ["intCol_1", "intCol_2", "intCol_4", "intCol_5", "intCol_6",
+SKEWED_COLS = ["intCol_2", "intCol_4", "intCol_5", "intCol_6",
                "intCol_7", "intCol_8", "intCol_10", "intCol_11", "intCol_12"]
-N_HASH_FEATURES = 2 ** 7  # 4096 — matches PySpark's fixed value
+# intCol_1 removed — needs special handling below, matching ctr_pipeline.py.
+NUMERIC_COLS_WITH_MISSING = ["intCol_0", "intCol_2", "intCol_3", "intCol_4",
+                             "intCol_5", "intCol_6", "intCol_8", "intCol_9",
+                             "intCol_10", "intCol_11", "intCol_12"]
+N_HASH_FEATURES = 2 ** 7  # matches PySpark's current setting (128 buckets)
 
 
 def load_and_clean(path):
     df = pd.read_csv(path)
     df[TARGET] = df[TARGET].astype(int)
+
+    # --- Missingness indicators (BEFORE imputation) — per EDA finding that
+    # missingness itself carries real CTR signal, e.g. intCol_11 missing ->
+    # CTR 0.245 vs present -> CTR 0.288.
+    for c in NUMERIC_COLS_WITH_MISSING:
+        if c in df.columns:
+            df[f"{c}_was_missing"] = df[c].isnull().astype(float)
+
+    # --- intCol_1 special handling — per EDA: -1 occurs in 122,002 rows
+    # (12.2%) with CTR 0.310 vs CTR 0.239 for 0 — a real, meaningful,
+    # non-missing value, NOT noise to blanket-clip to zero.
+    if "intCol_1" in df.columns:
+        df["intCol_1_is_neg1"] = (df["intCol_1"] == -1).astype(float)
+        df["intCol_1_is_neg2"] = (df["intCol_1"] == -2).astype(float)
+        # Safe to clip to 0 now — the -1/-2 signal is preserved above as
+        # explicit indicator columns; log1p itself cannot represent
+        # negative values in any case.
+        df["intCol_1"] = np.log1p(df["intCol_1"].clip(lower=0))
+
     for c in CAT_COLS:
         if c in df.columns:
             df[c] = df[c].fillna("missing").astype(str)
@@ -126,6 +149,19 @@ def build_model_and_grid(model_type):
     return clf, grid
 
 
+def compute_metrics(y_true, y_pred, y_prob):
+    """Same 6 metrics as ctr_pipeline.py's evaluate(), computed for
+    whichever split (train or test) is passed in."""
+    return {
+        "AUC_ROC": roc_auc_score(y_true, y_prob),
+        "AUC_PR": average_precision_score(y_true, y_prob),
+        "Accuracy": accuracy_score(y_true, y_pred),
+        "F1": f1_score(y_true, y_pred, average="weighted"),
+        "Weighted_Precision": precision_score(y_true, y_pred, average="weighted"),
+        "Weighted_Recall": recall_score(y_true, y_pred, average="weighted"),
+    }
+
+
 def run_model(model_type, X_train, X_test, y_train, y_test, out_dir):
     clf, grid = build_model_and_grid(model_type)
 
@@ -134,6 +170,17 @@ def run_model(model_type, X_train, X_test, y_train, y_test, out_dir):
     num_train = imputer.fit_transform(X_train[INT_COLS])
     num_test = imputer.transform(X_test[INT_COLS])
 
+    # Indicator columns (missingness flags + intCol_1 special values) —
+    # already computed in load_and_clean(), just pass them through as-is
+    # (no imputation/transformation needed, they're already 0/1 floats).
+    indicator_cols = (
+        [f"{c}_was_missing" for c in NUMERIC_COLS_WITH_MISSING]
+        + ["intCol_1_is_neg1", "intCol_1_is_neg2"]
+    )
+    indicator_cols = [c for c in indicator_cols if c in X_train.columns]
+    ind_train = X_train[indicator_cols].to_numpy()
+    ind_test = X_test[indicator_cols].to_numpy()
+
     # Categorical: hash all 26 cols into N_HASH_FEATURES buckets
     hasher = HasherWrapper(CAT_COLS, N_HASH_FEATURES)
     cat_train = hasher.transform(X_train)
@@ -141,8 +188,8 @@ def run_model(model_type, X_train, X_test, y_train, y_test, out_dir):
 
     # Assemble FIRST (numeric + hashed categorical), matching PySpark's
     # VectorAssembler -> StandardScaler order
-    Xtr_raw = hstack([csr_matrix(num_train), cat_train]).tocsr()
-    Xte_raw = hstack([csr_matrix(num_test), cat_test]).tocsr()
+    Xtr_raw = hstack([csr_matrix(num_train), csr_matrix(ind_train), cat_train]).tocsr()
+    Xte_raw = hstack([csr_matrix(num_test), csr_matrix(ind_test), cat_test]).tocsr()
 
     # FIXED: scale the FULL combined matrix, not just the numeric block —
     # matches PySpark's StandardScaler applied to the entire assembled vector
@@ -156,21 +203,24 @@ def run_model(model_type, X_train, X_test, y_train, y_test, out_dir):
     fit_time = time.time() - t0
 
     best = search.best_estimator_
-    y_pred = best.predict(Xte)
-    y_prob = best.predict_proba(Xte)[:, 1]
 
-    fpr, tpr, _ = roc_curve(y_test, y_prob)
+    # Predict on BOTH splits — training metrics reveal overfitting when
+    # compared against test metrics; PySpark's output reports both, so
+    # this mirrors that shape exactly.
+    y_pred_train = best.predict(Xtr)
+    y_prob_train = best.predict_proba(Xtr)[:, 1]
+    y_pred_test = best.predict(Xte)
+    y_prob_test = best.predict_proba(Xte)[:, 1]
+
+    fpr, tpr, _ = roc_curve(y_test, y_prob_test)
     roc_points = [{"fpr": float(f), "tpr": float(t)} for f, t in zip(fpr, tpr)]
 
     metrics = {
-        "AUC_ROC": roc_auc_score(y_test, y_prob),
-        "AUC_PR": average_precision_score(y_test, y_prob),
-        "Accuracy": accuracy_score(y_test, y_pred),
-        "F1": f1_score(y_test, y_pred, average="weighted"),
-        "Weighted_Precision": precision_score(y_test, y_pred, average="weighted"),
-        "Weighted_Recall": recall_score(y_test, y_pred, average="weighted"),
+        "training_metrics": compute_metrics(y_train, y_pred_train, y_prob_train),
+        "test_metrics": compute_metrics(y_test, y_pred_test, y_prob_test),
         "fit_time_sec": round(fit_time, 2),
-        "confusion_matrix": confusion_matrix(y_test, y_pred).tolist(),
+        "cv_avg_auc_by_param_combo": search.cv_results_["mean_test_score"].tolist(),
+        "confusion_matrix": confusion_matrix(y_test, y_pred_test).tolist(),
         "roc_points": roc_points,
         "best_params": search.best_params_,
     }
@@ -178,9 +228,9 @@ def run_model(model_type, X_train, X_test, y_train, y_test, out_dir):
     with open(os.path.join(out_dir, f"metrics_{model_type}.json"), "w") as f:
         json.dump(metrics, f, indent=2, default=str)
 
-    print(f"[{model_type.upper()}] " + json.dumps(
-        {k: v for k, v in metrics.items() if not isinstance(v, (list, dict))}, indent=2
-    ))
+    print(f"[{model_type.upper()}] training_metrics=" + json.dumps(metrics["training_metrics"], indent=2))
+    print(f"[{model_type.upper()}] test_metrics=" + json.dumps(metrics["test_metrics"], indent=2))
+    print(f"[{model_type.upper()}] fit_time_sec={metrics['fit_time_sec']}")
     return metrics
 
 
@@ -199,7 +249,12 @@ def main():
     print(f"    rows={len(df)}, load+clean time={time.time()-t0:.2f}s")
 
     print("[2/3] Splitting train/test (80/20, stratified)...")
-    X = df[INT_COLS + CAT_COLS]
+    indicator_cols = (
+        [f"{c}_was_missing" for c in NUMERIC_COLS_WITH_MISSING]
+        + ["intCol_1_is_neg1", "intCol_1_is_neg2"]
+    )
+    indicator_cols = [c for c in indicator_cols if c in df.columns]
+    X = df[INT_COLS + CAT_COLS + indicator_cols]
     y = df[TARGET]
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y

@@ -34,10 +34,9 @@ from pyspark.ml import Pipeline
 from pyspark.ml.feature import FeatureHasher, VectorAssembler, Imputer, StandardScaler
 from pyspark.ml.classification import (
     LogisticRegression,
-    RandomForestClassifier
+    RandomForestClassifier,
+    GBTClassifier,
 )
-from xgboost.spark import SparkXGBClassifier
-
 from pyspark.ml.evaluation import (
     BinaryClassificationEvaluator,
     MulticlassClassificationEvaluator,
@@ -53,7 +52,7 @@ TARGET = "target"
 
 # FIXED: was literal `2` (a broken edit) — this is the value that actually
 # produced your reported successful GBT run (4,096 hashed buckets).
-N_HASH_FEATURES = 2**7  # 128 hashed buckets
+N_HASH_FEATURES = 2**12  # 128
 
 SKEWED_COLS = ["intCol_1", "intCol_2", "intCol_4", "intCol_5", "intCol_6",
                "intCol_7", "intCol_8", "intCol_10", "intCol_11", "intCol_12"]
@@ -159,14 +158,8 @@ def build_pipeline_stages(model_type="lr"):
         clf = RandomForestClassifier(
             featuresCol="features", labelCol=TARGET, seed=42, numTrees=20
         )
-    elif model_type == "xgb":
-        clf = SparkXGBClassifier(
-            features_col="features",
-            label_col=TARGET,
-            num_workers=2,
-            seed=42,
-            n_estimators=50
-        )
+    elif model_type == "gbt":
+        clf = GBTClassifier(featuresCol="features", labelCol=TARGET, seed=42, maxIter=50)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -222,12 +215,12 @@ def run_model(train, test, model_type, out_dir, tune=True):
                 .addGrid(clf.maxDepth, [5, 10])
                 .addGrid(clf.numTrees, [30])
                 .build()
-                    )
-        else:  # xgb
+            )
+        else:  # gbt
             grid = (
                 ParamGridBuilder()
-                .addGrid(clf.max_depth, [5, 7])
-                .addGrid(clf.n_estimators, [50, 100])
+                .addGrid(clf.maxDepth, [5])
+                .addGrid(clf.maxIter, [20, 50])
                 .build()
             )
 
@@ -274,40 +267,13 @@ def run_model(train, test, model_type, out_dir, tune=True):
     if avg_cv_scores:
         metrics["cv_avg_auc_by_param_combo"] = avg_cv_scores
 
-    if model_type == "rf":
+    if model_type in ("rf", "gbt"):
         try:
             tree_model = best_pipeline_model.stages[-1]
             importances = tree_model.featureImportances.toArray().tolist()
-
             metrics["top_20_feature_importance_indices"] = sorted(
-                range(len(importances)),
-                key=lambda i: -importances[i]
+                range(len(importances)), key=lambda i: -importances[i]
             )[:20]
-
-        except Exception as e:
-            metrics["feature_importance_error"] = str(e)
-
-    elif model_type == "xgb":
-        try:
-            xgb_model = best_pipeline_model.stages[-1]
-
-            # Get the underlying XGBoost booster
-            booster = xgb_model.get_booster()
-
-            # Gain-based importance
-            importance_dict = booster.get_score(importance_type="gain")
-
-            # Convert to a list indexed by feature number
-            importances = [
-                importance_dict.get(f"f{i}", 0.0)
-                for i in range(N_HASH_FEATURES + len(INT_COLS))
-            ]
-
-            metrics["top_20_feature_importance_indices"] = sorted(
-                range(len(importances)),
-                key=lambda i: -importances[i]
-            )[:20]
-
         except Exception as e:
             metrics["feature_importance_error"] = str(e)
 
@@ -347,7 +313,7 @@ def main():
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", default="./results")
     parser.add_argument("--sample_frac", type=float, default=1.0)
-    parser.add_argument("--models", default="lr,rf,xgb")
+    parser.add_argument("--models", default="lr,rf,gbt")
     args = parser.parse_args()
     model_list = [m.strip() for m in args.models.split(",") if m.strip()]
 
