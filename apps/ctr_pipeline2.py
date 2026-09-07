@@ -52,7 +52,7 @@ TARGET = "target"
 
 # FIXED: was literal `2` (a broken edit) — this is the value that actually
 # produced your reported successful GBT run (4,096 hashed buckets).
-N_HASH_FEATURES = 2**12  # 128
+N_HASH_FEATURES = 2**7  # 128
 
 SKEWED_COLS = ["intCol_1", "intCol_2", "intCol_4", "intCol_5", "intCol_6",
                "intCol_7", "intCol_8", "intCol_10", "intCol_11", "intCol_12"]
